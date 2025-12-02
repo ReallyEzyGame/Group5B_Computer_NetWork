@@ -56,4 +56,5 @@ class VideoStream:
 		"""Get frame number."""
 		return self.frameNum
 	
-	
+	def tFrame(self):
+		return self.totalFrame
