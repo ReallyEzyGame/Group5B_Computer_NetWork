@@ -15,17 +15,26 @@ class CacheBuffer:
         
         if (self.readHandle != self.writeHandle):
             self.readHandle = (self.readHandle + 1) % self.capacity
-        else:
+        
+        if (self.readHandle == self.writeHandle):
             self.lock = True
         
         return result
     
     def write(self, data):
-        if self.writeHandle == self.readHandle:
-            self.lock = False
+        if self.writeHandle == self.readHandle and not self.lock:
             return False
         
         self.buffer[self.writeHandle] = data
         self.writeHandle = (self.writeHandle + 1) % self.capacity
 
+        if self.writeHandle == self.readHandle:
+            self.lock = False
+
         return True
+
+    def unlock(self):
+        self.lock = False
+
+    def lock(self):
+        self.lock = True
