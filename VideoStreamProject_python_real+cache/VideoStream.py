@@ -3,11 +3,22 @@ import os
 class VideoStream:
 	def __init__(self, filename):
 		self.filename = filename
+		self.totalFrame = 0
+		self.frameNum = 0
+
 		try:
 			self.file = open(filename, 'rb')
 		except:
 			raise IOError
-		self.frameNum = 0
+		
+		chunk = self.file.read(4 * 1024 * 1024)
+		border = b''
+		while chunk:
+			self.totalFrame += (border + chunk).count(b'\xFF\xD8')
+			border = chunk[-1:]
+			chunk = self.file.read(4 * 1024 * 1024)
+		
+		self.file.seek(0, os.SEEK_SET)
 		
 	def nextFrame(self):
 		"""Get next frame."""
@@ -23,7 +34,7 @@ class VideoStream:
 				break
 			prev = byte
 		
-		chunk = self.file.read(4096)
+		chunk = self.file.read(4 * 1024 * 1024)
 		prev = None
 		while chunk:
 			break_f = False
@@ -37,7 +48,7 @@ class VideoStream:
 			if break_f:
 				break
 			data.extend(chunk)
-			chunk = self.file.read(4096)
+			chunk = self.file.read(4 * 1024 * 1024)
 		self.frameNum += 1
 		return bytes(data)
 		
