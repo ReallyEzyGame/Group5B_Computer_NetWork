@@ -1,9 +1,10 @@
 from tkinter import *
 import tkinter.messagebox
 from PIL import Image, ImageTk
-import socket, threading, sys, traceback, os
+import socket, threading, sys, traceback, os, io
 
 from RtpPacket import RtpPacket
+from CacheBuffer import CacheBuffer
 
 CACHE_FILE_NAME = "cache-"
 CACHE_FILE_EXT = ".jpg"
@@ -34,6 +35,14 @@ class Client:
 		self.teardownAcked = 0
 		self.connectToServer()
 		self.frameNbr = 0
+
+		self.currentFrame = 0
+		self.totalFrames = 0
+		self.fps = 20
+		self.buffer = CacheBuffer(1 * self.fps) # cache 1 seconds
+
+		self.playEvent = threading.Event()
+		self.listenEvent = threading.Event()
 		
 	def createWidgets(self):
 		"""Build GUI."""
@@ -41,30 +50,46 @@ class Client:
 		self.setup = Button(self.master, width=20, padx=3, pady=3)
 		self.setup["text"] = "Setup"
 		self.setup["command"] = self.setupMovie
-		self.setup.grid(row=1, column=0, padx=2, pady=2)
+		self.setup.grid(row=2, column=0, padx=2, pady=2)
 		
 		# Create Play button		
 		self.start = Button(self.master, width=20, padx=3, pady=3)
 		self.start["text"] = "Play"
 		self.start["command"] = self.playMovie
-		self.start.grid(row=1, column=1, padx=2, pady=2)
+		self.start.grid(row=2, column=1, padx=2, pady=2)
 		
 		# Create Pause button			
 		self.pause = Button(self.master, width=20, padx=3, pady=3)
 		self.pause["text"] = "Pause"
 		self.pause["command"] = self.pauseMovie
-		self.pause.grid(row=1, column=2, padx=2, pady=2)
+		self.pause.grid(row=2, column=2, padx=2, pady=2)
 		
 		# Create Teardown button
 		self.teardown = Button(self.master, width=20, padx=3, pady=3)
 		self.teardown["text"] = "Teardown"
 		self.teardown["command"] =  self.exitClient
-		self.teardown.grid(row=1, column=3, padx=2, pady=2)
+		self.teardown.grid(row=2, column=3, padx=2, pady=2)
 		
 		# Create a label to display the movie
 		self.label = Label(self.master, height=19)
-		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5) 
-	
+		self.label.grid(row=0, column=0, columnspan=4, sticky=W+E+N+S, padx=5, pady=5)
+
+		timeContainer = Frame(self.master)
+		timeContainer.grid(row=1, column=0, columnspan=4, sticky=W+E+N+S)
+
+		timeContainer.grid_columnconfigure(1, weight=2)
+
+		self.time = Label(timeContainer, text="--:-- / --:--")
+		self.time.grid(row=0, column=0, sticky=W+E+N+S, padx=5, pady=5)
+
+		timelineContainer = Frame(timeContainer, bg="#E0E0E0")
+		timelineContainer.grid(row=0, column=1, sticky=W+E+N+S, padx=5, pady=5)
+
+		self.bufferline = Canvas(timelineContainer, bg="#C2C2C2", highlightthickness=0)
+		self.bufferline.place(relx=0, rely=0, relwidth=0.0)
+		self.timeline = Canvas(timelineContainer, bg="#F45B69", highlightthickness=0)
+		self.timeline.place(relx=0, rely=0, relwidth=0.0)
+
 	def setupMovie(self):
 		"""Setup button handler."""
 		if self.state == self.INIT:
@@ -73,27 +98,51 @@ class Client:
 	def exitClient(self):
 		"""Teardown button handler."""
 		self.sendRtspRequest(self.TEARDOWN)
+		self.stopListen()
+		self.stopDisplay()
 		self.master.destroy() # Close the gui window
-		os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
+		# os.remove(CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT) # Delete the cache image from video
 
 	def pauseMovie(self):
 		"""Pause button handler."""
 		if self.state == self.PLAYING:
-			self.sendRtspRequest(self.PAUSE)
+			self.state = self.READY
+			self.stopDisplay()
 	
 	def playMovie(self):
 		"""Play button handler."""
 		if self.state == self.READY:
+			print("yak")
 			# Create a new thread to listen for RTP packets
-			threading.Thread(target=self.listenRtp).start()
-			self.playEvent = threading.Event()
-			self.playEvent.clear()
+			self.startListen()
+			self.startDisplay()
 			self.sendRtspRequest(self.PLAY)
 	
-	def listenRtp(self):		
+	def startListen(self):
+		if self.listenEvent.is_set():
+			self.listenEvent.clear()
+		threading.Thread(target=self.listenRtp).start()
+
+	def startDisplay(self):
+		if self.playEvent.is_set():
+			self.playEvent.clear()
+		threading.Thread(target=self.displayFrame).start()
+
+	def stopListen(self):
+		self.listenEvent.set()
+
+	def stopDisplay(self):
+		self.playEvent.set()
+	
+	def listenRtp(self):
+		print("yes")
 		"""Listen for RTP packets."""
 		while True:
 			try:
+				# Stop listening upon requesting PAUSE or TEARDOWN
+				if self.listenEvent.is_set():
+					break
+
 				data = self.rtpSocket.recv(20480)
 				if data:
 					rtpPacket = RtpPacket()
@@ -101,19 +150,42 @@ class Client:
 					
 					currFrameNbr = rtpPacket.seqNum()
 					print("Current Seq Num: " + str(currFrameNbr))
-										
-					if currFrameNbr > self.frameNbr: # Discard the late packet
-						self.frameNbr = currFrameNbr
-						self.updateMovie(self.writeFrame(rtpPacket.getPayload()))
+
+					if not self.buffer.write(rtpPacket):
+						self.stopListen()
+						self.sendRtspRequest(self.PAUSE)
+					elif currFrameNbr > self.frameNbr:
+						self.frameNbr = currFrameNbr			
+						buffer = self.frameNbr / self.totalFrames
+						self.bufferline.place_configure(relwidth=buffer)
+
 			except OSError:
 				break
 			except:
-				# Stop listening upon requesting PAUSE or TEARDOWN
-				if self.playEvent.is_set():
-					break
-				
 				# Upon receiving ACK for TEARDOWN request,
 				# close the RTP socket
+				if self.teardownAcked == 1:
+					self.rtpSocket.shutdown(socket.SHUT_RDWR)
+					self.rtpSocket.close()
+					break
+	
+	def displayFrame(self):
+		while True:
+			try:
+				if self.playEvent.is_set():
+					break
+
+				data = self.buffer.read()
+				if data:
+					if self.listenEvent.is_set():
+						self.startListen()
+						self.sendRtspRequest(self.PLAY)
+					print(data.seqNum())
+					if data.seqNum() > self.currentFrame: # Discard the late packet
+						self.playEvent.wait(1/self.fps)
+						self.currentFrame = data.seqNum()
+						self.updateMovie(data.getPayload())
+			except:
 				if self.teardownAcked == 1:
 					self.rtpSocket.shutdown(socket.SHUT_RDWR)
 					self.rtpSocket.close()
@@ -128,11 +200,24 @@ class Client:
 		
 		return cachename
 	
-	def updateMovie(self, imageFile):
+	def updateMovie(self, imageData):
 		"""Update the image file as video frame in the GUI."""
-		photo = ImageTk.PhotoImage(Image.open(imageFile))
+		photo = ImageTk.PhotoImage(Image.open(io.BytesIO(imageData)))
 		self.label.configure(image = photo, height=288) 
 		self.label.image = photo
+
+		if self.totalFrames == 0:
+			return
+
+		totalSec = int(self.totalFrames / self.fps)
+
+		time = self.currentFrame / self.totalFrames
+		self.time.config(text="{:02}:{:02} / {:02}:{:02}".format(
+			int(time * totalSec // 60), int(time * totalSec) % 60,
+			int(totalSec // 60), totalSec % 60
+		))
+
+		self.timeline.place_configure(relwidth=time)
 		
 	def connectToServer(self):
 		"""Connect to the Server. Start a new RTSP/TCP session."""
@@ -206,7 +291,7 @@ class Client:
 		while True:
 			reply = self.rtspSocket.recv(1024)
 			
-			if reply: 
+			if reply:
 				self.parseRtspReply(reply.decode("utf-8"))
 			
 			# Close the RTSP socket upon requesting Teardown
@@ -230,23 +315,25 @@ class Client:
 			
 			# Process only if the session ID is the same
 			if self.sessionId == session:
-				if int(lines[0].split(' ')[1]) == 200: 
+				if int(lines[0].split(' ')[1]) == 200:
 					if self.requestSent == self.SETUP:
 						#-------------
 						# TO COMPLETE
 						#-------------
 						# Update RTSP state.
 						self.state = self.READY
+
+						self.totalFrames = int(lines[3].split(' ')[1])
 						
 						# Open RTP port.
-						self.openRtpPort() 
+						self.openRtpPort()
 					elif self.requestSent == self.PLAY:
 						self.state = self.PLAYING
 					elif self.requestSent == self.PAUSE:
 						self.state = self.READY
 						
 						# The play thread exits. A new thread is created on resume.
-						self.playEvent.set()
+						self.stopListen()
 					elif self.requestSent == self.TEARDOWN:
 						self.state = self.INIT
 						
