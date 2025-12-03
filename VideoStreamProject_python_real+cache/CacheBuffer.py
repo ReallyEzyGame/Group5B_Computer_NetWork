@@ -4,7 +4,7 @@ class CacheBuffer:
         self.buffer = [None] * capacity
         self.readHandle = 0
         self.writeHandle = 0
-        self.lock = False
+        self.lock = True
     
     def read(self):
         if self.lock:
@@ -13,8 +13,7 @@ class CacheBuffer:
         result = self.buffer[self.readHandle]
         self.buffer[self.readHandle] = None
         
-        if (self.readHandle != self.writeHandle):
-            self.readHandle = (self.readHandle + 1) % self.capacity
+        self.readHandle = (self.readHandle + 1) % self.capacity
         
         if (self.readHandle == self.writeHandle):
             self.lock = True
@@ -32,6 +31,9 @@ class CacheBuffer:
             self.lock = False
 
         return True
+    
+    def isLocked(self):
+        return self.lock
 
     def unlock(self):
         self.lock = False
