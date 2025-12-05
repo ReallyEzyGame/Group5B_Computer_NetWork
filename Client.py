@@ -5,6 +5,7 @@ from tkinter import *
 import tkinter.messagebox
 from PIL import Image, ImageTk
 import socket, threading, sys, traceback, os
+import io
 import time
 
 from RtpPacket import RtpPacket
@@ -24,7 +25,7 @@ class Client:
 	PAUSE = 2
 	TEARDOWN = 3
  
- 
+
 	def __init__(self, master, serveraddr, serverport, rtpport, filename):
 		self.master = master
 		self.master.protocol("WM_DELETE_WINDOW", self.handler)
@@ -46,7 +47,8 @@ class Client:
 		self.requestStartFrame = 0
 		self.totalFrames = 0
 		self.fps = 20
-		self.frameBuffer = queue.Queue()				# contains frames that is used to cache
+		# contains frames that is used to cache
+		self.frameBuffer = queue.Queue()
 		# Fragment reassembly buffer: frameId -> list of (pktSeq, chunk)
 		self.fragment_buffer = {}
 
@@ -56,11 +58,11 @@ class Client:
 
 		# events
 		self.playEvent = None
-
+		self.is_dragging = False
 		# desired display area initial size (will adapt)
 		self.display_width = 960
 		self.display_height = 540
-
+		self.timeline_width = 0
 		# Keep reference to current displayed PhotoImage to avoid GC
 		self._photo_image = None
 
@@ -120,6 +122,9 @@ class Client:
 		self.timeline_canvas = Canvas(self.slider_frame, height=10, bg='#333333')
 		self.timeline_canvas.pack(side=BOTTOM, fill=X, expand=True)
   
+		self.timeline_canvas.bind("<Button-1>", self.on_timeline_click)
+		self.timeline_canvas.bind("<B1-Motion>", self.on_timeline_drag)
+		self.timeline_canvas.bind("<ButtonRelease-1>", self.on_timeline_release)
 		# Bind resize so we can adapt displayed image if user resizes window
 		self.master.bind("<Configure>", self._on_window_resize)
 
@@ -216,6 +221,9 @@ class Client:
   
 	def updateTimelineCanvas(self):
 		"""ReDraw the canvas time bar(cache, watched)"""
+		if getattr(self, 'is_dragging', False):
+			return
+
 		canvas_width = self.timeline_canvas.winfo_width()
 		canvas_height = self.timeline_canvas.winfo_height()
   
@@ -244,6 +252,7 @@ class Client:
 		thumb_y_center = canvas_height / 2
   
 		self.timeline_canvas.create_oval(watched_x - thumb_radius, thumb_y_center - thumb_radius, watched_x + thumb_radius, thumb_y_center + thumb_radius, fill="#FFFFFF", outline="#000000")
+	
 	def pauseMovie(self):
 		if self.state == self.PLAYING:
 			self.sendRtspRequest(self.PAUSE)
@@ -255,14 +264,79 @@ class Client:
 			self.playEvent.clear()
 
 			threading.Thread(target=self.listenRtp, daemon=True).start()
+			# wait for an amount of to be transfered
+			time.sleep(0.05)
+   
 			threading.Thread(target=self.playVideoThread).start()
 
 			self.sendRtspRequest(self.PLAY)
 
+	def on_timeline_click(self, event):
+		"""Handling Click on Time Line Bar"""
+		self.is_dragging = True
+		self.seek_from_event(event.x)
+  
+	def on_timeline_drag(self, event):
+		"Handling Drag on time line bar"
+		if self.is_dragging:
+			self.seek_from_event(event.x)
+   
+	def on_timeline_release(self, event):
+		"""Handling release on timeline bar"""
+		self.is_dragging = False
+  
+	def seek_from_event(self, x_pixel):
+		"""Calculate frame from x and call seek_to"""
+		if self.totalFrames == 0:
+			return
+
+		canvas_width = self.timeline_canvas.winfo_width()
+		if canvas_width <= 0:
+			return
+
+		x_pixel = max(0, min(x_pixel, canvas_width))
+		target_frame = int((x_pixel / canvas_width) * self.totalFrames)
+  
+		cache_size = self.frameBuffer.qsize()
+		currFrameNbr = self.frameNbr
+		max_seekable = currFrameNbr + cache_size
+  
+		if target_frame <= currFrameNbr:
+			print("Unable to Seek backward")
+		elif max_seekable <= target_frame:
+			self.seek_to(max_seekable)
+		elif target_frame != currFrameNbr:
+			self.seek_to(target_frame)
+   
 	def playVideoThread(self):
 		while True:
 			try:
-				data = self.frameBuffer.get()
+				if self.playEvent.is_set() and self.requestSent == self.PAUSE:
+					break
+				currFrameNbr, data = self.frameBuffer.get()
+    
+				# only display newer frame
+				if currFrameNbr > self.frameNbr:
+					print(f"Display frame {currFrameNbr} / {currFrameNbr + self.frameBuffer.qsize()}")
+     
+					self.frameNbr = currFrameNbr
+					self.updateMovie(data)
+     
+					if self.frameNbr % 20 == 0:
+						self.updateTimelineCanvas()
+						self.updateTimeLabel(currFrameNbr)
+      
+				time.sleep(_TIME_SLEEP_)
+			except Exception as e:
+				print(f"Error: {e}\n")	
+				break
+
+	# ---------------- RTP listening & assembly ----------------
+	def listenRtp(self):
+		while True:
+			try:
+				data = self.rtpSocket.recv(65535)
+	 
 				if data:
 					rtpPacket = RtpPacket()
 					try:
@@ -280,9 +354,9 @@ class Client:
 						last_flag = payload[4]
 						chunk = payload[5:]
 						buf = self.fragment_buffer.setdefault(frameId, [])
-      
+	  
 						buf.append((pktSeq, chunk))
-      
+	  
 						if last_flag == 1:
 							buf.sort(key=lambda x: x[0])
 							frame_bytes = b''.join([c for _, c in buf])
@@ -290,57 +364,15 @@ class Client:
 								del self.fragment_buffer[frameId]
 							except:
 								pass
-							# display only newer frames
-							if frameId > self.frameNbr:
-								self.frameNbr = frameId
-								self.updateMovie(frame_bytes)
-        
-								if self.frameNbr % 20 == 0:
-									self.updateTimeLabel(self.frameNbr)
-									self.updateTimelineCanvas()
+							# put frame id and data to the queue
+							self.frameBuffer.put((frameId,frame_bytes))
+		
 					else:
 						# legacy: treat entire payload as JPEG
 						currFrameNbr = rtpPacket.seqNum()
-						if currFrameNbr > self.frameNbr:
-							self.frameNbr = currFrameNbr
-							self.updateMovie(payload)
-       
-							if self.frameNbr % 20 == 0:
-								self.updateTimeLabel(self.frameNbr)
-								self.updateTimelineCanvas()
-			except socket.timeout:
-				continue
-			except OSError:
-				break
-			except Exception as e:
-				# stop if playEvent set
-				if hasattr(self, 'playEvent') and self.playEvent and self.playEvent.is_set():
-					break
-				# if teardown acked, close socket
-				if self.teardownAcked == 1:
-					try:
-						self.rtpSocket.shutdown(socket.SHUT_RDWR)
-					except:
-						pass
-					try:
-						self.rtpSocket.close()
-					except:
-						pass
-					break
-				print("listenRtp exception:", e)
-				traceback.print_exc()
-				break
-		# Wait for a current time
-		time.sleep(_TIME_SLEEP_)
-	# ---------------- RTP listening & assembly ----------------
-	def listenRtp(self):
-		while True:
-			try:
-				data = self.rtpSocket.recv(65535)
-
-				if data:
-					self.frameBuffer.put(data)
-
+						# put id and payload to the queue
+						self.frameBuffer.put((currFrameNbr,payload))
+	   
 			except socket.timeout:
 				continue
 			except OSError:
@@ -365,13 +397,6 @@ class Client:
 				break
 
 	# ---------------- image handling ----------------
-	def writeFrame(self, data):
-		cachename = CACHE_FILE_NAME + str(self.sessionId) + CACHE_FILE_EXT
-		with open(cachename, "wb") as file:
-			file.write(data)
-   
-		return cachename
-
 	def updateMovie(self, imageOrBytes):
 		# Ensure GUI update runs on main thread
 		self.master.after(0, lambda: self._update_image(imageOrBytes))
@@ -380,8 +405,7 @@ class Client:
 		try:
 			# Load image (from bytes or path)
 			if isinstance(imageOrBytes, (bytes, bytearray)):
-				cachename = self.writeFrame(imageOrBytes)
-				img = Image.open(cachename)
+				img = Image.open(io.BytesIO(imageOrBytes))
 			else:
 				img = Image.open(imageOrBytes)
 
@@ -554,7 +578,7 @@ class Client:
 						# get total frame
 						if (len(lines) >= 5):
 							self.totalFrames = int(lines[3].split(" ", 1)[1].strip())
-       
+	   
 						self.state = self.READY
 						# open RTP port for incoming packets
 						self.openRtpPort()
@@ -699,3 +723,22 @@ class Client:
 		threading.Thread(target=self._switch_resolution, args=(new_file,), daemon=True).start()
 		self.master.after(500, self.playMovie)
 
+	def seek_to(self, frameNbr):
+		"""Moving forward to a frame in the cache range"""
+		# moving in the cache range
+		if self.frameNbr <= frameNbr <= self.frameNbr + self.frameBuffer.qsize():
+			skip_count = frameNbr - self.frameNbr
+			# pop frame out until get the require frame
+			for _ in range(skip_count):
+				try:
+					self.frameBuffer.get_nowait()
+				except queue.Empty:
+					break
+ 
+			self.frameNbr = frameNbr
+			self.updateTimeLabel(frameNbr)
+   
+			temp_dragging = self.is_dragging
+			self.is_dragging = False
+			self.updateTimelineCanvas()
+			self.is_dragging = temp_dragging

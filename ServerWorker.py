@@ -4,7 +4,7 @@ import sys, traceback, threading, socket
 from VideoStream import VideoStream
 from RtpPacket import RtpPacket
 
-_TIME_WAIT_ = 0.04
+_TIME_WAIT_ = 0.02
 
 class ServerWorker:
     SETUP = 'SETUP'
